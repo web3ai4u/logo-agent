@@ -3,22 +3,26 @@
 
 BASE_NEG = (
     "3d, metallic, chrome, emboss, bevel, shadow, gradient, texture, mockup, "
-    "badge, coin, medal, ring, frame, studio lighting, grey background, "
+    "badge, coin, medal, ring, circular seal, round frame, border, wreath, crest, "
+    "shield, coat of arms, stamp, emblem, studio lighting, grey background, "
     "text, words, letters, watermark, photo, blur, clutter, multiple logos, "
-    "presentation board, product shot"
+    "presentation board, product shot, decorative ornament"
 )
 
 STYLE_FLAT = (
-    "flat 2d vector logo symbol, simple geometric silhouette, solid black shape, "
-    "clean sharp edges, isolated on pure white background, centered, no decoration"
+    "flat 2d vector logo icon, one simple abstract geometric symbol, "
+    "single compact solid silhouette, black shape on pure white background, "
+    "centered with generous white space, clean hard edges, professional brand mark, "
+    "not an illustration, not a badge, not a medallion"
 )
 
 CRAFT_RULES = (
-    "one compact shape, one visual idea, optically centered, balanced negative space, "
+    "one visual idea only, one compact silhouette, no enclosing shape, no outer ring, "
+    "no frame, no border, no decorative details, optically centered, balanced mass, "
     "recognizable at 32 pixels, suitable for favicon, stamp and embroidery"
 )
 
-NEGSPACE_DIRECTIVE = "use meaningful negative space, not ornamental detail"
+NEGSPACE_DIRECTIVE = "simple functional cutout only if it improves the silhouette"
 
 SHAPE_SEMANTICS = {
     "скорость": "forward motion, one diagonal cut, compact dynamic geometry",
