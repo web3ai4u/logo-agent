@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""LogoForge (финал): диалог -> бриф -> 4 концепции с пояснениями.
- Flow: /logo -> ТЗ (текст/файл) ИЛИ 'вопросы' -> 5 вопросов -> бриф -> 'да' -> 4 фото + философия.
-"""
+"""LogoForge финал+v2: диалог -> бриф -> 4 концепции + монохром-тест.
+Слой дизайнерских навыков вынесен в design_skills.py."""
 
 from __future__ import annotations
 
@@ -10,19 +9,19 @@ import io
 import logging
 import os
 import re
+import time
 
 import requests
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 
+import design_skills as ds
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+MODELS = ["flux", "sana", "turbo"]
 
-NEG = ("text, letters, words, watermark, signature, gradient, 3d render, "
-       "photo, blur, clutter")
-MODELS = ["flux", "sana", "turbo"]          # перебор при 429
-
-ASK_BRIEF, ASK_FIELDS, CONFIRM = range(3)   # состояния диалога
+ASK_BRIEF, ASK_FIELDS, CONFIRM = range(3)
 
 FIELDS = ["brand", "value", "audience", "industry", "tone"]
 LABELS = {"brand": "Бренд", "value": "Ценность", "audience": "Аудитория",
@@ -34,12 +33,12 @@ QUESTIONS = {
     "industry": "Отрасль / ниша? (финтех, кофейни, логистика, medtech…)",
     "tone": "Характер бренда: luxury, minimal, tech, friendly, bold? (одно слово)",
 }
-VALUE_MAP = {  # ценность -> EN для image-модели
+VALUE_MAP = {
     "скорость": "speed and motion", "надёжность": "reliability and trust",
     "доверие": "trust and security", "статус": "premium status",
     "забота": "care and warmth", "инновации": "innovation and technology",
 }
-_PATTERNS = {  # авто-извлечение полей из свободного ТЗ
+_PATTERNS = {
     "brand": r"(?:бренд|brand|название)\s*[:=]\s*([^,\n]+)",
     "value": r"(?:ценность|value)\s*[:=]\s*([^,\n]+)",
     "audience": r"(?:аудитория|audience|клиент)\s*[:=]\s*([^,\n]+)",
@@ -51,24 +50,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ---------- изображения (Pollinations, защита от 429) ----------
+# ---------- генерация (Pollinations + защита от 429) ----------
 
-def build_image_url(prompt: str, model: str) -> str:
+def build_image_url(prompt: str, model: str, negative: str) -> str:
     return (
         f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
         f"?width=768&height=768&nologo=true&safe=true&model={model}"
-        f"&negative_prompt={requests.utils.quote(NEG)}"
+        f"&negative_prompt={requests.utils.quote(negative)}"
     )
 
 
-def fetch_image_bytes(prompt: str):
+def fetch_image_bytes(prompt: str, negative: str):
     """2 попытки на модель, при 429 пауза и следующая. None = всё легло."""
     for model in MODELS:
         for _ in range(2):
             try:
-                r = requests.get(build_image_url(prompt, model), timeout=90)
+                r = requests.get(build_image_url(prompt, model, negative), timeout=90)
                 if r.status_code == 429:
-                    import time; time.sleep(4); break
+                    time.sleep(4)
+                    break
                 if r.ok and r.headers.get("content-type", "").startswith("image/"):
                     return r.content
             except requests.RequestException as e:
@@ -76,10 +76,9 @@ def fetch_image_bytes(prompt: str):
     return None
 
 
-# ---------- разбор ТЗ и файлов ----------
+# ---------- ТЗ: разбор текста и файлов ----------
 
 def parse_brief(text: str) -> dict:
-    """Извлекает поля из ТЗ; если маркеров нет — сохраняет как описание."""
     found = {}
     for f, pat in _PATTERNS.items():
         m = re.search(pat, text, re.I)
@@ -91,7 +90,6 @@ def parse_brief(text: str) -> dict:
 
 
 def extract_doc(data: bytes, name: str):
-    """TXT/PDF/DOCX -> текст. Иначе None (без OCR, честно)."""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     try:
         if ext in ("txt", "md"):
@@ -107,47 +105,50 @@ def extract_doc(data: bytes, name: str):
     return None
 
 
-# ---------- концепции: промпт + пояснение + палитра + носители ----------
+# ---------- концепции с применением навыков 1-5, 10, 12 ----------
 
 def build_concepts(b: dict) -> list:
     brand = b.get("brand", "brand")
-    value_en = VALUE_MAP.get(b.get("value", "").lower(), b.get("value", "professionalism"))
+    value = b.get("value", "")
+    value_en = VALUE_MAP.get(value.lower(), value or "professionalism")
+    shape = ds.shape_for(value)                      # навык 1
+    pal = ds.palette_for(b.get("tone"))              # навык 3
     subj = f"{brand} ({value_en})" + (f", {b['industry']}" if b.get("industry") else "")
+    craft = ds.CRAFT_RULES                           # навыки 4/7/8/11
     return [
         ("1. Symbol-led — знак",
          f"minimal flat vector logo icon, single geometric symbol representing {subj}, "
-         f"clean simple shape, black on white background, centered, professional brand mark",
-         f"Знак кодирует ценность «{b.get('value', '—')}» геометрической метафорой: "
-         f"читается от favicon до билборда, без шума — чистая функция для аудитории «{b.get('audience', '—')}».",
-         "#111111 / #FFFFFF", "favicon, иконка приложения, вывеска, упаковка"),
+         f"{shape}, {ds.NEGSPACE_DIRECTIVE}, {craft}, colors: {pal[3]}, white background",
+         f"Семантика формы: ценность «{value or '—'}» → {shape}. Негативное пространство "
+         f"даёт второй слой чтения (эффект стрелки FedEx): запоминаемость без деталей.",
+         f"{pal[0]} / {pal[1]} / {pal[2]}", "favicon, иконка, вывеска, упаковка"),
         ("2. Typography-led — wordmark",
          f"modern minimalist wordmark logo, elegant custom letterforms spelling '{brand}', "
-         f"clean sans-serif, precise kerning, black on white background, no icon",
-         f"Wordmark закрепляет имя «{brand}» в памяти: ритм литер и кернинг работают "
-         f"без знака — минимальный достаточный актив в нише «{b.get('industry', '—')}».",
-         "#0A0A0A / #F5F5F5", "шапка сайта, документы, соцсети"),
+         f"clean geometric sans-serif, precise kerning, {craft}, color {pal[0]} on white, no icon",
+         f"Wordmark держит имя «{brand}»: кернинг и ритм литер работают без знака — "
+         f"минимальный достаточный актив в нише «{b.get('industry', '—')}».",
+         f"{pal[0]} / {pal[2]}", "сайт, документы, соцсети"),
         ("3. Luxury Minimal — премиум",
-         f"luxury minimalist logo emblem for {subj}, sophisticated geometric monogram, "
-         f"black and subtle gold, elegant thin lines, centered on white background",
-         f"Воздух и сдержанная палитра дают статус без крика: премиальность читается "
-         f"через точность — соответствует характеру «{b.get('tone', '—')}».",
-         "#000000 / #C9A227", "упаковка, визитки, премиум-носители"),
+         f"luxury minimalist emblem for {subj}, symmetric geometric monogram, thin precise "
+         f"lines, {craft}, colors: {pal[3]}, white background",
+         f"Сдержанность и воздух дают статус: премиальность читается через точность "
+         f"построения, а не декор. Характер: «{b.get('tone', '—')}».",
+         f"{pal[0]} / {pal[1]}", "упаковка, визитки, премиум-носители"),
         ("4. Competitive Edge — отличие",
-         f"unique abstract logo mark for {subj}, bold distinctive geometric shape, "
-         f"unexpected composition, single color black on white background, memorable",
-         f"Клише ниши «{b.get('industry', '—')}» обойдены сознательно: форма вне паттернов "
-         f"конкурентов, но сохраняет профессионализм и доверие.",
-         "#101820 / #FFFFFF", "реклама, мерч, медиа"),
+         f"unique abstract logo mark for {subj}, bold unexpected geometry, {shape} broken "
+         f"by one deliberate angle, {craft}, colors: {pal[3]}, white background",
+         f"Клише ниши «{b.get('industry', '—')}» исключены negative-промптом: форма вне "
+         f"паттернов конкурентов, но сохраняет профессионализм и доверие.",
+         f"{pal[0]} / {pal[2]}", "реклама, мерч, медиа"),
     ]
 
 
-# ---------- диалог (ConversationHandler) ----------
+# ---------- диалог ----------
 
 async def flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["brief"] = {}
     await update.message.reply_text(
-        "🎨 Принимаю задачу.\n\n"
-        "Пришли ТЗ текстом или файлом (PDF / DOCX / TXT).\n"
+        "🎨 Принимаю задачу.\n\nПришли ТЗ текстом или файлом (PDF / DOCX / TXT).\n"
         "Если ТЗ нет — напиши «вопросы», и я задам 5 коротких сам.")
     return ASK_BRIEF
 
@@ -169,8 +170,7 @@ async def on_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await f.download_to_memory(out=bio)
         text = extract_doc(bio.getvalue(), doc.file_name or "file.txt")
         if text is None:
-            await update.message.reply_text(
-                "Формат не читается. Пришли TXT, PDF, DOCX или просто текст.")
+            await update.message.reply_text("Формат не читается. Пришли TXT, PDF, DOCX или текст.")
             return ASK_BRIEF
         brief.update(parse_brief(text))
     else:
@@ -187,9 +187,8 @@ async def on_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    brief = context.user_data["brief"]
     field = context.user_data["missing"].pop(0)
-    brief[field] = update.message.text.strip()[:120]
+    context.user_data["brief"][field] = update.message.text.strip()[:120]
     return await ask_next(update, context)
 
 
@@ -200,7 +199,7 @@ async def show_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• Описание: {b['description'][:200]}")
     await update.message.reply_text(
         "📋 Бриф, который я сформулировал:\n" + "\n".join(lines) +
-        "\n\nОтветь «да» — рисую 4 концепции. «нет» — начнём заново.")
+        "\n\nОтветь «да» — рисую 4 концепции + монохром-тест. «нет» — заново.")
     return CONFIRM
 
 
@@ -218,17 +217,18 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """4 концепции: фото + пояснение + палитра + носители, затем философия."""
     b = context.user_data["brief"]
-    status = await update.message.reply_text("🎨 Рисую 4 концепции (~1-3 мин)...")
+    negative = ds.negative_for(b.get("industry"))    # навык 2: клише под запретом
+    status = await update.message.reply_text("🎨 Рисую 4 концепции + монохром-тест (~2-4 мин)...")
     try:
         await status.delete()
     except Exception:
         pass
 
+    concepts = build_concepts(b)
     ok = 0
-    for name, prompt, rationale, palette, uses in build_concepts(b):
-        img = fetch_image_bytes(prompt)
+    for name, prompt, rationale, palette, uses in concepts:
+        img = fetch_image_bytes(prompt, negative)
         if img:
             await update.message.reply_photo(
                 photo=img,
@@ -237,19 +237,23 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             ok += 1
         else:
-            await update.message.reply_text(
-                f"{name}: модели перегружены (429). Повтори /logo через минуту.")
-        await asyncio.sleep(3)   # не ловим общий лимит 300 RPM
+            await update.message.reply_text(f"{name}: модели перегружены (429). Повтори /logo через минуту.")
+        await asyncio.sleep(3)
+
+    # Навык 9: монохром-тест — доказательство масштабируемости, а не обещание
+    mono = fetch_image_bytes(concepts[0][1] + ds.MONO_SUFFIX, negative)
+    if mono:
+        await update.message.reply_photo(
+            photo=mono,
+            caption="🧪 Монохром-тест: силуэт варианта 1 в один цвет. "
+                    "Выжил = знак работает в favicon, гравировке, факсе, вышивке.")
 
     await update.message.reply_text(
-        f"✅ Готово: {ok}/4\n\n"
-        "📐 Философия решения:\n"
-        "• Смысл первичен: форма выведена из ценности, а не из вкуса.\n"
-        "• Масштабируемость: каждый знак проверен на favicon и билборд.\n"
-        "• Отличие: клише отрасли обойдены сознательно.\n"
-        "• Сдержанность: премиальность через точность, а не декор.\n"
-        "• Пояснения: чтобы решение защищалось аргументами, а не «нравится/не нравится».\n\n"
-        "Следующий шаг: напиши номер варианта — подготовлю SVG, мокапы и мини-гайд.")
+        f"✅ Готово: {ok}/4 + монохром\n\n"
+        "📐 Философия: смысл → форма → сетка → отличие → проверка.\n"
+        "Применены навыки: семантика формы, анти-клише, палитра ≤3, "
+        "круговая сетка/golden ratio, негативное пространство, монохром-тест.\n\n"
+        "Напиши номер варианта — подготовлю проработку (SVG, мокапы, мини-гайд).")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,17 +268,15 @@ async def nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎨 LogoForge — агент логотипов премиум-класса.\n\n"
-        "/logo — начать: пришлю бриф-вопросы или приму твоё ТЗ\n"
-        "/help — справка\n/cancel — прервать диалог")
+        "/logo — начать (ТЗ или 5 вопросов)\n/help — справка\n/cancel — прервать")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Как это работает:\n"
-        "1. /logo → пришли ТЗ (текст/PDF/DOCX/TXT) или напиши «вопросы»\n"
-        "2. Я задам до 5 вопросов и сам сформулирую бриф\n"
-        "3. Покажу бриф → «да» → 4 концепции с пояснениями, палитрой и носителями\n"
-        "4. Дальше — проработка выбранного направления")
+        "1. /logo → ТЗ (текст/PDF/DOCX/TXT) или «вопросы»\n"
+        "2. Формулирую бриф → «да»\n"
+        "3. 4 концепции с пояснениями + палитрой + носителями\n"
+        "4. Монохром-тест знака\n5. Проработка выбранного направления")
 
 
 def main():
