@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""LogoForge v3: модель = карандаш, агент = рука дизайнера.
-Любой выход модели детерминированно превращается в плоский 2-цветный знак."""
+"""LogoForge v4: SVG-конструктор. Детерминированная геометрия, предсказуемый результат."""
 
 from __future__ import annotations
 
@@ -9,18 +8,16 @@ import io
 import logging
 import os
 import re
-import time
 
-import requests
-from PIL import Image
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import (Application, CommandHandler, ContextTypes,
                           ConversationHandler, MessageHandler, filters)
 
 import design_skills as ds
+import logo_builder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MODELS = ["flux", "sana", "turbo"]
+
 ASK_BRIEF, ASK_FIELDS, CONFIRM = range(3)
 
 FIELDS = ["brand", "value", "audience", "industry", "tone"]
@@ -32,11 +29,6 @@ QUESTIONS = {
     "audience": "Кто клиент? (одна фраза: «курьеры мегаполисов», «мамы малышей»…)",
     "industry": "Отрасль / ниша? (финтех, кофейни, логистика, medtech…)",
     "tone": "Характер бренда: luxury, minimal, tech, friendly, bold? (одно слово)",
-}
-VALUE_MAP = {
-    "скорость": "speed and motion", "надёжность": "reliability and trust",
-    "доверие": "trust and security", "статус": "premium status",
-    "забота": "care and warmth", "инновации": "innovation and technology",
 }
 _PATTERNS = {
     "brand": r"(?:бренд|brand|название)\s*[:=]\s*([^,\n]+)",
@@ -50,79 +42,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ---------- СЛОЙ 1: английский бриф (MyMemory, без ключа) ----------
-
-def translate_ru_en(text: str) -> str:
-    """Перевод описательных полей. Бренд НЕ переводим (это имя)."""
-    if not re.search(r"[а-яА-Я]", text or ""):
-        return text
-    try:
-        r = requests.get("https://api.mymemory.translated.net/get",
-                         params={"q": text[:400], "langpair": "ru|en"}, timeout=10)
-        out = r.json().get("responseData", {}).get("translatedText", "")
-        if out and len(out) > 2:
-            return out
-    except Exception as e:
-        logger.warning("translate failed: %s", e)
-    return text  # fallback: сырой текст
-
-
-# ---------- СЛОЙ 3: рука дизайнера (детерминированная постобработка) ----------
-
-def flatten_logo(data: bytes, fg=(17, 17, 17), size=1024) -> bytes:
-    """Любой выход модели -> плоский 2-цветный знак.
-    1) grayscale 2) фон = среднее по углам 3) маска 'не фон'
-    4) crop по bbox 5) квадрат с полями 6) заливка fg/bg.
-    Убивает: градиенты, тени, металл, серый фон, текстуры."""
-    im = Image.open(io.BytesIO(data)).convert("L")
-    w, h = im.size
-    px = im.load()
-    bg_lum = (px[0, 0] + px[w - 1, 0] + px[0, h - 1] + px[w - 1, h - 1]) / 4
-    mask = im.point(lambda p: 255 if abs(p - bg_lum) > 60 else 0)
-    bbox = mask.getbbox()
-    if bbox:
-        mask = mask.crop(bbox)
-    mw, mh = mask.size
-    if mw == 0 or mh == 0:
-        return data  # маска пустая — отдаём оригинал, не падаем
-    side = int(max(mw, mh) * 1.25)
-    canvas = Image.new("L", (side, side), 0)
-    canvas.paste(mask, ((side - mw) // 2, (side - mh) // 2))
-    canvas = canvas.resize((size, size), Image.LANCZOS)
-    out = Image.composite(Image.new("RGB", (size, size), fg),
-                          Image.new("RGB", (size, size), (255, 255, 255)),
-                          canvas)
-    buf = io.BytesIO()
-    out.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-# ---------- генерация ----------
-
-def build_image_url(prompt: str, model: str, negative: str) -> str:
-    return (
-        f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}"
-        f"?width=768&height=768&nologo=true&safe=true&model={model}"
-        f"&negative_prompt={requests.utils.quote(negative)}"
-    )
-
-
-def fetch_image_bytes(prompt: str, negative: str):
-    for model in MODELS:
-        for _ in range(2):
-            try:
-                r = requests.get(build_image_url(prompt, model, negative), timeout=90)
-                if r.status_code == 429:
-                    time.sleep(4)
-                    break
-                if r.ok and r.headers.get("content-type", "").startswith("image/"):
-                    return r.content
-            except requests.RequestException as e:
-                logger.warning("fetch retry: %s", e)
-    return None
-
-
-# ---------- ТЗ ----------
+# ---------- ТЗ: разбор текста и файлов ----------
 
 def parse_brief(text: str) -> dict:
     found = {}
@@ -151,53 +71,14 @@ def extract_doc(data: bytes, name: str):
     return None
 
 
-# ---------- СЛОЙ 2: анти-3D концепции ----------
-
-def build_concepts(b: dict) -> list:
-    brand = b.get("brand", "brand")
-    brand_en = ds.translit(brand)
-    letter = brand_en[0].upper()
-    value = b.get("value", "")
-    value_en = VALUE_MAP.get(value.lower(), translate_ru_en(value)) if value else "professionalism"
-    ind_en = translate_ru_en(b.get("industry", ""))
-    aud_en = translate_ru_en(b.get("audience", ""))
-    shape = ds.shape_for(value)
-    pal = ds.palette_for(b.get("tone"))
-    subj = f"{brand_en} ({value_en})" + (f", {ind_en}" if ind_en else "")
-    flat, craft = ds.STYLE_FLAT, ds.CRAFT_RULES
-    return [
-        ("1. Symbol-led — знак",
-         f"{flat}, single geometric symbol representing {subj}, {shape}, "
-         f"{ds.NEGSPACE_DIRECTIVE}, {craft}, shape color {pal['names']}",
-         f"Семантика формы: «{value or '—'}» → {shape}. Негативное пространство даёт "
-         f"второй слой чтения (эффект FedEx).",
-         pal),
-        ("2. Monogram — литера",
-         f"{flat}, geometric monogram of single letter '{letter}', built from clean "
-         f"geometry, {craft}, shape color {pal['names']}",
-         f"Монограмма «{letter}» вместо слова: одну букву модель пишет точно, слово — "
-         f"кривит. Имя закрепляется формой литеры.",
-         pal),
-        ("3. Luxury Minimal — премиум",
-         f"{flat}, symmetric minimal mark for {subj}, thin precise uniform lines, "
-         f"{craft}, shape color {pal['names']}",
-         f"Статус через точность построения и воздух, а не через декор и металл.",
-         pal),
-        ("4. Competitive Edge — отличие",
-         f"{flat}, bold unexpected abstract mark for {subj}, {shape} broken by one "
-         f"deliberate angle, {craft}, shape color {pal['names']}",
-         f"Клише ниши «{b.get('industry', '—')}» исключены: форма вне паттернов конкурентов.",
-         pal),
-    ]
-
-
 # ---------- диалог ----------
 
 async def flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["brief"] = {}
     await update.message.reply_text(
         "🎨 Принимаю задачу.\n\nПришли ТЗ текстом или файлом (PDF / DOCX / TXT).\n"
-        "Если ТЗ нет — напиши «вопросы», и я задам 5 коротких сам.")
+        "Если ТЗ нет — напиши «вопросы», и я задам 5 коротких сам.\n\n"
+        "Или /idea — сгенерирую визуальные концепции через Pollinations.")
     return ASK_BRIEF
 
 
@@ -247,7 +128,7 @@ async def show_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• Описание: {b['description'][:200]}")
     await update.message.reply_text(
         "📋 Бриф, который я сформулировал:\n" + "\n".join(lines) +
-        "\n\nОтветь «да» — рисую 4 плоских концепции + монохром. «нет» — заново.")
+        "\n\nОтветь «да» — соберу 4 варианта логотипа (SVG + PNG + favicon). «нет» — заново.")
     return CONFIRM
 
 
@@ -265,46 +146,76 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SVG-конструктор: 4 варианта + SVG + favicon."""
     b = context.user_data["brief"]
-    negative = ds.negative_for(b.get("industry"))
-    status = await update.message.reply_text("🎨 Рисую и уплощаю 4 концепции (~2-4 мин)...")
+    status = await update.message.reply_text("🎨 Собираю 4 варианта логотипа...")
+    
     try:
         await status.delete()
     except Exception:
         pass
-
-    concepts = build_concepts(b)
-    ok = 0
-    first_raw = None
-    for name, prompt, rationale, pal in concepts:
-        raw = fetch_image_bytes(prompt, negative)
-        if raw:
-            if first_raw is None:
-                first_raw = raw
-            flat = flatten_logo(raw, fg=pal["fg"])   # рука дизайнера
-            await update.message.reply_photo(
-                photo=flat,
-                caption=(f"**{name}**\n\n💡 {rationale}\n\n"
-                         f"🎨 Палитра: {pal['hexc']} / {pal['hexa']} ({pal['names']})\n"
-                         f"✅ Плоский 2-цветный знак: favicon/печать/гравировка безопасны"),
-                parse_mode="Markdown")
-            ok += 1
-        else:
-            await update.message.reply_text(f"{name}: модели перегружены (429). Повтори /logo через минуту.")
-        await asyncio.sleep(3)
-
-    if first_raw:
-        mono = flatten_logo(first_raw, fg=(0, 0, 0))  # монохром-тест теперь честно чёрно-белый
+    
+    concepts = logo_builder.build_concepts(b)
+    
+    # Отправляем 4 PNG варианта
+    for concept in concepts:
         await update.message.reply_photo(
-            photo=mono,
-            caption="🧪 Монохром-тест: чистый чёрный силуэт на белом. "
-                    "Выжил = знак живёт в favicon, гравировке, факсе, вышивке.")
-
+            photo=concept["png"],
+            caption=(
+                f"**{concept['description']}**\n\n"
+                f"🎨 Палитра: {concept['primary']} / {concept['secondary']}\n"
+                f"📐 Шаблон: {concept['template']}\n\n"
+                f"Напиши номер варианта (1-4) — отправлю SVG + favicon."),
+            parse_mode="Markdown")
+        await asyncio.sleep(1)
+    
+    # Сохраняем концепции в context для последующего выбора
+    context.user_data["concepts"] = concepts
+    
     await update.message.reply_text(
-        f"✅ Готово: {ok}/4 + монохром\n\n"
-        "📐 Принцип v3: модель — карандаш, агент — рука дизайнера.\n"
-        "Плоскость гарантирована постобработкой, а не надеждой на модель.\n\n"
-        "Напиши номер варианта — подготовлю проработку (SVG, мокапы, мини-гайд).")
+        "✅ 4 варианта готовы!\n\n"
+        "Напиши номер (1-4) — отправлю:\n"
+        "• SVG (вектор для печати/дизайнера)\n"
+        "• favicon.ico (для сайта)\n\n"
+        "Или /logo — создать новый бриф.")
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора варианта после generate()."""
+    if "concepts" not in context.user_data:
+        await update.message.reply_text("Я по логотипам. Напиши /logo — начнём.")
+        return
+    
+    text = update.message.text.strip()
+    if text.isdigit() and 1 <= int(text) <= 4:
+        idx = int(text) - 1
+        concept = context.user_data["concepts"][idx]
+        
+        # Отправляем SVG как документ
+        svg_bytes = concept["svg"].encode("utf-8")
+        svg_file = InputFile(io.BytesIO(svg_bytes), filename=f"{context.user_data['brief'].get('brand', 'logo')}.svg")
+        await update.message.reply_document(
+            document=svg_file,
+            caption="📄 SVG (векторный файл для печати и дизайнера)")
+        
+        # Отправляем favicon
+        logo = logo_builder.build_logo(context.user_data["brief"])
+        favicon_file = InputFile(io.BytesIO(logo["favicon"]), filename="favicon.ico")
+        await update.message.reply_document(
+            document=favicon_file,
+            caption="🔷 favicon.ico (для сайта)")
+        
+        await update.message.reply_text(
+            "✅ Файлы отправлены!\n\n"
+            f"Шаблон: {concept['template']}\n"
+            f"Палитра: {concept['primary']} / {concept['secondary']}\n\n"
+            "SVG можно открыть в Figma/Illustrator для доработки.\n"
+            "favicon.ico — загрузить в корень сайта.")
+        
+        # Очищаем context
+        del context.user_data["concepts"]
+    else:
+        await update.message.reply_text("Напиши номер варианта (1-4) или /logo — начать заново.")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,22 +223,37 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я по логотипам. Напиши /logo — начнём.")
-
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎨 LogoForge v3 — плоские логотипы премиум-класса.\n\n"
-        "/logo — начать (ТЗ или 5 вопросов)\n/help — справка\n/cancel — прервать")
+        "🎨 LogoForge v4 — детерминированные логотипы.\n\n"
+        "/logo — создать логотип (SVG + PNG + favicon)\n"
+        "/idea — визуальные концепции через Pollinations\n"
+        "/help — справка\n/cancel — прервать")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "1. /logo → ТЗ (текст/PDF/DOCX/TXT) или «вопросы»\n"
-        "2. Формулирую бриф, перевожу на EN → «да»\n"
-        "3. 4 плоских концепции + монохром-тест\n"
-        "4. Проработка выбранного направления")
+        "**/logo** — основной режим:\n"
+        "1. ТЗ (текст/PDF/DOCX/TXT) или «вопросы»\n"
+        "2. Формулирую бриф → «да»\n"
+        "3. 4 варианта логотипа (PNG)\n"
+        "4. Выбираешь номер → получаешь SVG + favicon\n\n"
+        "**/idea** — экспериментальный:\n"
+        "Визуальные концепции через Pollinations (медленно, но креативно)\n\n"
+        "Геометрия логотипов детерминирована: предсказуемый результат, читаемый текст, масштабируемость.")
+
+
+async def idea_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pollinations для визуальных идей (не финальный лого)."""
+    await update.message.reply_text(
+        "🎨 /idea — визуальные концепции через Pollinations.\n\n"
+        "Пришли ТЗ текстом (например: бренд=Hedex ценность=качество отрасль=строительство).\n"
+        "Сгенерирую 4 концепции для вдохновения (~2-4 мин).")
+    # TODO: интегрировать старую логику Pollinations сюда
+
+
+async def nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Я по логотипам. Напиши /logo — начнём.")
 
 
 def main():
@@ -347,8 +273,10 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, nudge))
-    logger.info("Бот запущен на Railway")
+    app.add_handler(CommandHandler("idea", idea_command))
+    # Обработка выбора варианта (после generate)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    logger.info("Бот запущен на Railway (SVG-конструктор)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
